@@ -9,6 +9,20 @@ import torch.utils.checkpoint as checkpoint
 from timm.layers import DropPath, to_2tuple, trunc_normal_
 from ptflops import get_model_complexity_info
 
+# ============================================================
+# HSSDCT: Hierarchical Spatial-Spectral Dense Correlation Network
+# Paper: "HSSDCT: Factorized Spatial-Spectral Correlation for
+#        Hyperspectral Image Fusion" (arXiv:2602.00490)
+#
+# 本文件实现了HSSDCT网络的所有核心模块，包括：
+#   1. DFE (Dual Feature Extraction) / SSFE - 空间-光谱特征提取模块 (论文 Section 2.3)
+#   2. SCC (Spatial-Channel Correlation) / SSCL - 空间-光谱相关层 (论文 Section 2.3)
+#   3. HierarchicalTransformerBlock - 分层Transformer块 (HDRTB的核心组件)
+#   4. SwinBasedFeatFusionBlock - 分层密集残差Transformer块 HDRTB (论文 Section 2.2)
+#   5. YDCFN - 双分支融合网络整体架构 (论文 Section 2.1 & Figure 1)
+#   6. HyDCFN - 顶层包装器（含AWGN噪声注入）
+# ============================================================
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Convex-Optimization-Aware SR net')
     
@@ -61,7 +75,14 @@ def parse_args():
 
 
 class DFE(nn.Module):
-    """ Dual Feature Extraction 
+    """ Dual Feature Extraction (DFE)
+    
+    【论文对应】SSFE (Spatial-Spectral Feature Extraction) 模块，见论文 Section 2.3 "Feature Projection" 及 Figure 4。
+    SSFE采用双分支设计生成Query和Value表示：
+      - 卷积路径（conv分支）：用于局部空间编码（local spatial encoding）
+      - 线性路径（linear分支）：用于光谱编码/通道分割的矩阵分解（spectral encoding by channel splitting）
+    两路特征通过逐元素相乘融合，产生同时富含空间和光谱上下文的Q和V表示，从而降低复杂度。
+
     Args:
         in_features (int): Number of input channels.
         out_features (int): Number of output channels.
@@ -71,12 +92,16 @@ class DFE(nn.Module):
 
         self.out_features = out_features
 
+        # [SSFE - 卷积分支] 用于局部空间编码：1x1降维 -> 3x3局部特征提取 -> 1x1升维
+        # 对应论文 Figure 4 中 SSFE 的 Conv 分支（含 Conv 3x3 和 Linear/Conv 1x1 路径）
         self.conv = nn.Sequential(nn.Conv2d(in_features, in_features // 5, 1, 1, 0),
                         nn.LeakyReLU(negative_slope=0.2, inplace=True),
                         nn.Conv2d(in_features // 5, in_features // 5, 3, 1, 1),
                         nn.LeakyReLU(negative_slope=0.2, inplace=True),
                         nn.Conv2d(in_features // 5, out_features, 1, 1, 0))
         
+        # [SSFE - 线性分支] 用于光谱编码：通过1x1卷积实现通道间的线性投影
+        # 对应论文 Figure 4 中 SSFE 的 Linear 分支
         self.linear = nn.Conv2d(in_features, out_features,1,1,0)
 
     def forward(self, x, x_size):
@@ -92,6 +117,9 @@ class DFE(nn.Module):
 
 class Mlp(nn.Module):
     """ MLP-based Feed-Forward Network
+    【论文对应】SSCL中的MLP部分，以及HDRTB中的FFN（Feed-Forward Network）。
+    在SSCL中，输出经过SSFA（Spatial-Spectral Feature Aggregation）后通过MLP进行进一步变换。
+
     Args:
         in_features (int): Number of input channels.
         hidden_features (int | None): Number of hidden channels. Default: None
@@ -118,7 +146,9 @@ class Mlp(nn.Module):
 
 
 def window_partition(x, window_size):
-    """
+    """【HDRTB辅助函数】将特征图划分为非重叠的局部窗口，用于分层窗口自相关计算。
+    在SSCL（论文 Section 2.3）中，输入特征首先被划分为窗口，然后在每个窗口内分别计算SpaSC和SpeSC。
+    
     Args:
         x: (B, H, W, C)
         window_size (tuple): window size
@@ -133,7 +163,8 @@ def window_partition(x, window_size):
 
 
 def window_reverse(windows, window_size, H, W):
-    """
+    """【HDRTB辅助函数】window_partition的逆操作，将窗口特征合并回完整特征图。
+    在SSCL（论文 Section 2.3）中，SpaSC和SpeSC计算完成后需要通过此函数恢复原始分辨率。
     Args:
         windows: (num_windows*B, window_size, window_size, C)
         window_size (tuple): Window size
@@ -150,7 +181,13 @@ def window_reverse(windows, window_size, H, W):
 
 class DynamicPosBias(nn.Module):
     # The implementation builds on Crossformer code https://github.com/cheerss/CrossFormer/blob/main/models/crossformer.py
-    """ Dynamic Relative Position Bias.
+    """ Dynamic Relative Position Bias (动态相对位置偏置)
+    
+    【论文对应】SpaSC（Spatial Self-Correlation）中的位置编码模块。
+    在SpaSC计算空间相关性时，需要引入相对位置偏置来增强空间位置感知能力。
+    本模块基于Crossformer实现，通过MLP将2D相对位置坐标映射为每个注意力头的偏置值。
+    见论文 Figure 4 中 SpaSC 分支的位置偏置部分。
+
     Args:
         dim (int): Number of input channels.
         num_heads (int): Number of heads for spatial self-correlation.
@@ -188,7 +225,28 @@ class DynamicPosBias(nn.Module):
         return pos
 
 class SCC(nn.Module):
-    """ Spatial-Channel Correlation.
+    """ Spatial-Channel Correlation (SCC) / Spatial-Spectral Correlation Layer (SSCL)
+    
+    【论文核心模块】对应论文 Section 2.3 "Spatial-Spectral Correlation Layer" 及 Figure 4。
+    
+    SSCL是HSSDCT的核心创新，将特征聚合解耦为空间和光谱两个相关性路径，实现线性复杂度：
+      1. **SSFE (self.qv = DFE)**: 空间-光谱特征提取，生成Q和V表示
+         - 卷积路径：局部空间编码
+         - 线性路径：光谱编码/矩阵分解
+      2. **SpaSC (spatial_self_correlation)**: 空间自相关
+         - 公式：SpaSC(Q,V) = (QV^T / sqrt(d)) * V   （论文公式3）
+         - 通过与空间压缩的Value token计算亲和力来建模长程空间依赖
+      3. **SpeSC (channel_self_correlation)**: 光谱（通道）自相关
+         - 公式：SpeSC(Q,V) = (Q^T V / HW) * V^T        （论文公式4）
+         - 通过计算通道级亲和力保留精细的光谱特征签名
+      4. **SSFA (self.proj)**: 空间-光谱特征聚合（Spatial-Spectral Feature Aggregation）
+         - 将SpaSC和SpeSC的输出通过逐元素拼接后线性投影融合
+    
+    相比传统窗口自注意力的三大优势：
+      (i) 复杂度随窗口大小线性增长（而非二次方），可使用更大的分层窗口
+      (ii) 支持HDRTB中渐进式增大的窗口以获得更大感受野
+      (iii) 显式建模光谱相关性，这在Transformer-based HSI融合方法中常被忽略
+
     Args:
         dim (int): Number of input channels.
         base_win_size (tuple[int]): The height and width of the base window.
@@ -229,6 +287,10 @@ class SCC(nn.Module):
         self.pos = DynamicPosBias(self.dim // 4, self.num_heads, residual=False)
     
     def spatial_linear_projection(self, x):
+        """【SpaSC辅助函数】空间线性投影：将Value特征在窗口内按base_win_size进行空间压缩。
+        通过将每个base_window内的token聚合为一个表示，降低V的空间分辨率，
+        从而使SpaSC的计算复杂度从O(N^2)降为O(N * N')，其中N' = H'W' << HW（论文公式3）。
+        """
         B, num_h, L, C = x.shape
         H, W = self.window_size
         map_H, map_W = self.base_win_size
@@ -238,24 +300,37 @@ class SCC(nn.Module):
         return x
     
     def spatial_self_correlation(self, q, v):
+        """【SSCL - SpaSC】空间自相关 (Spatial Self-Correlation)
+        
+        【论文对应】论文 Section 2.3 公式(3): SpaSC(Q,V) = (QV^T / sqrt(d)) * V
+        
+        在分层窗口内，通过将Query与空间压缩后的Value token进行相关性计算，
+        实现高效的长程空间上下文建模。关键步骤：
+          1. 对V进行空间线性投影（spatial_linear_projection），压缩空间维度
+          2. 计算相关性图: corr_map = Q @ V_compressed^T / scale
+          3. 添加可学习的动态相对位置偏置（DynamicPosBias）增强位置感知
+          4. 通过相关性图对压缩后的V加权得到空间增强特征
+        
+        这种设计避免了标准自注意力的二次复杂度，使得可以使用更大的分层窗口。
+        """
         
         B, num_head, L, C = q.shape
 
-        # spatial projection
+        # spatial projection: 将V从 [B, head, HW, C] 压缩到 [B, head, H'W', C]
         v = self.spatial_linear_projection(v)
 
-        # compute correlation map
+        # compute correlation map: Q(V')^T / sqrt(d)，对应论文公式(3)中的 QV^T/sqrt(d)
         corr_map = (q @ v.transpose(-2,-1)) / self.scale
 
-        # add relative position bias
-        # generate mother-set
+        # add relative position bias - 添加动态相对位置偏置以编码空间位置信息
+        # generate mother-set: 生成完整的相对位置坐标网格
         position_bias_h = torch.arange(1 - self.H_sp, self.H_sp, device=v.device)
         position_bias_w = torch.arange(1 - self.W_sp, self.W_sp, device=v.device)
         biases = torch.stack(torch.meshgrid(position_bias_h, position_bias_w, indexing='ij'))
         rpe_biases = biases.flatten(1).transpose(0, 1).contiguous().float()
         pos = self.pos(rpe_biases)
 
-        # select position bias
+        # select position bias - 根据窗口内token的相对位置索引选择对应的位置偏置
         coords_h = torch.arange(self.H_sp, device=v.device)
         coords_w = torch.arange(self.W_sp, device=v.device)
         coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing='ij'))
@@ -273,35 +348,49 @@ class SCC(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous() 
         corr_map = corr_map + relative_position_bias.unsqueeze(0)
 
-        # transformation
+        # transformation: 通过相关性图对V加权，得到空间自相关输出
         v_drop = self.value_drop(v)
         x = (corr_map @ v_drop).permute(0,2,1,3).contiguous().view(B, L, -1) 
 
         return x
     
     def channel_self_correlation(self, q, v):
+        """【SSCL - SpeSC】光谱/通道自相关 (Spectral Self-Correlation)
+        
+        【论文对应】论文 Section 2.3 公式(4): SpeSC(Q,V) = (Q^T V / HW) * V^T
+        
+        与SpaSC互补，SpeSC在光谱（通道）维度上建模相关性：
+          - 采用单头策略，将所有头的Q和V在通道维度上拼接
+          - 计算通道级亲和力矩阵: corr_map = Q^T V / L（L=HW为空间 token 数）
+          - 通过通道级相关性对V转置后加权，保留精细光谱签名
+        
+        这对于高光谱图像融合至关重要，因为高光谱数据的核心价值在于其精细的光谱分辨能力。
+        """
         
         B, num_head, L, C = q.shape
 
-        # apply single head strategy
+        # apply single head strategy - 采用单头策略：将所有注意力头的Q/V在通道维拼接
         q = q.permute(0,2,1,3).contiguous().view(B, L, num_head*C)
         v = v.permute(0,2,1,3).contiguous().view(B, L, num_head*C)
 
-        # compute correlation map
+        # compute correlation map: Q^T V / HW，对应论文公式(4)
         corr_map = (q.transpose(-2,-1) @ v) / L
         
-        # transformation
+        # transformation: corr_map @ V^T，得到光谱自相关输出
         v_drop = self.value_drop(v)
         x = (corr_map @ v_drop.transpose(-2,-1)).permute(0,2,1).contiguous().view(B, L, -1)
 
         return x
 
     def forward(self, x):
-        """
-        Args:
-            x: input features with shape of (B, H, W, C)
-        """
+        """【SSCL前向传播】完整执行空间-光谱相关层计算流程
         
+        数据流（对应论文 Figure 4）:
+          Input F -> [SSFE/DFE] -> Q,V -> [Split] -> Q,V (各半通道)
+            -> [SpaSC分支] -> x_spatial (C/2维)
+            -> [SpeSC分支] -> x_channel (C/2维)
+            -> [Concat] -> [SSFA/Linear proj] -> Output
+        """
         xB,xH,xW,xC = x.shape
         qv = self.qv(x.view(xB,-1,xC), (xH,xW)).view(xB, xH, xW, xC)
         # window partition
@@ -334,7 +423,22 @@ class SCC(nn.Module):
 
 
 class HierarchicalTransformerBlock(nn.Module):
-    """ Hierarchical Transformer Block.
+    """ Hierarchical Transformer Block (分层Transformer块)
+    
+    【论文对应】HDRTB (Hierarchical Dense-Residue Transformer Block) 的核心构建单元，
+    对应论文 Section 2.2 及 Figure 2/3。
+    
+    本模块将SCC（即SSCL）封装为标准Transformer Block的形式，包含：
+      - LayerNorm + SSCL（空间-光谱相关）+ 残差连接
+      - LayerNorm + MLP(FFN) + 残差连接
+    支持可变的分层窗口大小（hierarchical window size），这是HDRTB实现渐进式感受野扩大的基础。
+    
+    HDRTB的两个关键设计理念（论文 Section 2.2）：
+      1. **分层窗口（Hierarchical Windows）**：窗口大小随深度递增（如 {4,8,16,16}），
+         浅层捕获局部纹理，深层聚合全局上下文
+      2. **密集残差连接（Dense-Residue Connections）**：各层特征通过拼接+1x1卷积融合，
+         有效扩大感受野且不显著增加复杂度（公式2: F_out = F_in + gamma * Conv_1x1(Cat(F1,F2,F3))）
+    
     Args:
         dim (int): Number of input channels.
         input_resolution (tuple[int]): Input resulotion.
@@ -385,6 +489,18 @@ class HierarchicalTransformerBlock(nn.Module):
         return x
 
     def forward(self, x, x_size, win_size):
+        """【HDRTB子块前向传播】执行单层分层Transformer计算
+        
+        流程: 
+          1. 将序列特征reshape为2D特征图
+          2. padding确保尺寸能被window_size整除
+          3. 通过SSCL（SCC）进行空间-光谱相关计算
+          4. 去除padding，恢复原始分辨率
+          5. LayerNorm + 残差连接（Post-Norm风格）
+          6. FFN(MLP) + 残差连接
+        
+        对应论文 Figure 2 中 SSCL 内部的 iLayerNorm -> SSCL -> MLP 结构。
+        """
         H, W = x_size
         B, L, C = x.shape
         shortcut = x
@@ -491,6 +607,30 @@ class MultiScaleFeatAggregation(nn.Module):
         return out * 0.2 + x
 
 class SwinBasedFeatFusionBlock(nn.Module):
+    """【HDRTB完整实现】Swin-Based Feature Fusion Block (基于Swin的特征融合块)
+    
+    【论文对应】HDRTB (Hierarchical Dense-Residue Transformer Block)，论文 Section 2.2 及 Figure 2/3。
+    
+    这是HSSDCT中用于多尺度特征聚合的核心模块，实现了论文中描述的两大创新：
+    
+    1. **分层窗口（Hierarchical Windows）**：
+       - 通过 hier_win_ratios 参数控制每层的窗口大小相对于 base_win_size 的比例
+       - 默认 [0.5, 1, 2, 2] 对应4个渐进增大的窗口，例如 base=(8,8) 时窗口为 {(4,4), (8,8), (16,16), (16,16)}
+       - 论文实验中使用的窗口大小为 {4, 8, 16, 16}
+       - 浅层小窗口捕获细粒度局部纹理，深层大窗口建模全局语义结构
+    
+    2. **密集残差连接（Dense-Residue Connections）**：
+       - 每层提取的特征 x_i 都与之前所有层特征拼接后送入下一层
+       - 最终通过 1x1 卷积投影并乘以缩放因子 gamma=0.2 与输入残差相加
+       - 公式：F_out = F_in + 0.2 * Conv_1x1(Cat(F_1, F_2, F_3, F_4))   （论文公式2）
+       - 这避免了梯度消失问题并增强特征复用
+    
+    结构: swin1 -> adjust1 -> [cat(x,x1)] -> swin2 -> adjust2 -> [cat(x,x1,x2)] 
+          -> swin3 -> adjust3 -> [cat(x,x1,x2,x3)] -> swin4(MLP ratio=1) -> adjust4
+    其中每个swin是HierarchicalTransformerBlock（内含SSCL），每个adjust是1x1卷积通道调整层。
+    
+    注意: 第4个swin块的mlp_ratio=1（而非默认的4），用于轻量化最后的特征变换。
+    """
     def __init__(self, dim, input_resolution, depth, num_heads, base_win_size, mlp_ratio, drop, value_drop, drop_path, norm_layer, gc, patch_size, img_size, hier_win_ratios=[0.5,1,2,2,4]):
         super(SwinBasedFeatFusionBlock, self).__init__()
 
@@ -544,6 +684,19 @@ class SwinBasedFeatFusionBlock(nn.Module):
        
 
     def forward(self, x, xsize):
+        """【HDRTB前向传播】执行密集残差特征融合
+        
+        数据流（对应论文 Figure 2 的 HDRTB 结构和 Figure 3(d)）:
+          Input x 
+            -> swin1(最小窗口) -> adjust1(降维到gc) -> LeakyReLU -> x1
+            -> [cat(x, x1)] -> swin2(中等窗口) -> adjust2(降维到gc) -> LeakyReLU -> x2  
+            -> [cat(x, x1, x2)] -> swin3(较大窗口) -> adjust3(降维到gc) -> LeakyReLU -> x3
+            -> [cat(x, x1, x2, x3)] -> swin4(最大窗口, mlp_ratio=1) -> adjust4(恢复到dim) -> LeakyReLU -> x4
+          Output = x4 * 0.2 + x   （残差连接，gamma=0.2，论文公式2）
+        
+        每层通过PatchEmbed/PatchUnEmbed在Transformer序列格式和图像格式间转换，
+        以支持HierarchicalTransformerBlock的窗口操作。
+        """
         x1 = self.pe(self.lrelu(self.adjust1(self.pue(self.swin1(x,xsize, (self.win_hs[0], self.win_ws[0])), xsize))))
         x2 = self.pe(self.lrelu(self.adjust2(self.pue(self.swin2(torch.cat((x, x1), -1), xsize, (self.win_hs[1], self.win_ws[1])), xsize))))
         x3 = self.pe(self.lrelu(self.adjust3(self.pue(self.swin3(torch.cat((x, x1, x2), -1), xsize, (self.win_hs[2], self.win_ws[2])), xsize))))
@@ -552,6 +705,18 @@ class SwinBasedFeatFusionBlock(nn.Module):
         return x4 * 0.2 + x   
 
 class SwinBasedFeatFusionBlock_final_block(nn.Module):
+    """【最终融合HDRTB】基于Swin Transformer的最终特征融合块
+    
+    【论文对应】F_final 融合层中的 HDRTB，用于对融合后的光谱特征（YFD）进行精细化重建。
+    
+    与 SwinBasedFeatFusionBlock 的区别：
+      - 使用标准 SwinTransformerBlock（带shifted window机制）而非 HierarchicalTransformerBlock
+      - 支持 shift_size 参数实现窗口移位（SW-MSA），增强跨窗口信息交互
+      - 同样采用密集残差连接结构（4个子块级联 + 残差输出）
+    
+    此模块位于双分支特征相加后的最终重建路径中（论文 Figure 1 中的 F_final 部分），
+    对输出 HR-HSI 进行最后的细节恢复和重建。
+    """
     def __init__(self, dim, input_resolution, depth, num_heads, window_size, shift_size, mlp_ratio, qkv_bias, qk_scale, drop, attn_drop, drop_path, norm_layer, gc, patch_size, img_size):
         super(SwinBasedFeatFusionBlock_final_block, self).__init__()
 
@@ -606,6 +771,10 @@ class SwinBasedFeatFusionBlock_final_block(nn.Module):
             norm_layer=None)
 
     def forward(self, x, xsize):
+        """【最终融合HDRTB前向传播】使用Swin Transformer（带窗口移位）进行密集残差特征融合
+        与SwinBasedFeatFusionBlock结构类似，但使用shifted-window SwinTransformerBlock增强跨窗口交互。
+        输出: x4 * 0.2 + x （残差连接）
+        """
         x1 = self.pe(self.lrelu(self.adjust1(self.pue(self.swin1(x,xsize), xsize))))
         x2 = self.pe(self.lrelu(self.adjust2(self.pue(self.swin2(torch.cat((x, x1), -1), xsize), xsize))))
         x3 = self.pe(self.lrelu(self.adjust3(self.pue(self.swin3(torch.cat((x, x1, x2), -1), xsize), xsize))))
@@ -666,6 +835,11 @@ def window_reverse_swin(windows, window_size, H, W):
 
 class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
+    
+    【论文对应】用于最终重建层（SwinBasedFeatFusionBlock_final_block）中的标准窗口多头自注意力。
+    注意: HDRTB的主体使用的是SSCL（SCC模块）而非此标准W-MSA，因为SSCL实现了线性复杂度的
+    空间-光谱解耦相关。此W-MSA仅在最终的Swin-based融合块中使用，提供shifted-window机制。
+    
     It supports both of shifted and non-shifted window.
     Args:
         dim (int): Number of input channels.
@@ -763,7 +937,15 @@ class WindowAttention(nn.Module):
 
 
 class SwinTransformerBlock(nn.Module):
-    r""" Swin Transformer Block.
+    r""" Swin Transformer Block (Swin Transformer块)
+    
+    【论文对应】用于最终重建层（SwinBasedFeatFusionBlock_final_block）中的标准Swin Transformer块。
+    与HierarchicalTransformerBlock的区别：本模块使用标准的W-MSA/SW-MSA（二次复杂度），
+    而非SSCL的线性复杂度空间-光谱解耦注意力。支持shifted window机制增强跨窗口交互。
+    
+    额外包含 HAI (Hyperprior-based Adaptive Initialization) 的 gamma 参数，
+    通过可学习的缩放因子实现自适应残差连接。
+
     Args:
         dim (int): Number of input channels.
         input_resolution (tuple[int]): Input resulotion.
@@ -1165,6 +1347,50 @@ class PatchUnEmbed(nn.Module):
 
 
 class YDCFN(nn.Module):
+    """【论文核心网络】YDCFN - HSSDCT的整体双分支融合网络架构
+    
+    【论文对应】论文 Section 2.1 "Overall Framework" 及 Figure 1。
+    
+    HSSDCT的整体架构遵循双分支设计：
+    
+    ┌─────────────────────────────────────────────────────────────┐
+    │                    HSSDCT 整体架构 (Figure 1)                 │
+    │                                                             │
+    │   LR-HSI (低分辨率高光谱图像)          HR-MSI (高分辨率多光谱图像)  │
+    │   64×64×172                           256×256×Mm (4或6波段)   │
+    │        │                                     │                │
+    │   [光谱分支 Spectral Branch]         [空间分支 Spatial Branch]  │
+    │        │                                     │                │
+    │   concat(LR-HSI, LR-MSI)               concat(HR-MSI, HR-HSI)  │
+    │   Conv3x3 + LeakyReLU                 Conv3x3 + LeakyReLU      │
+    │   Upsample ×2                         (无需上采样)              │
+    │        │                                     │                │
+    │   HDRTB ×2 (分层窗口特征提取)           HDRTB ×2                   │
+    │   (SwinBasedFeatFusionBlock)          (SwinBasedFeatFusionBlock)│
+    │        │                                     │                │
+    │   Upsample ×2                          Conv3x3                  │
+    │   Conv3x3                              LeakyReLU                │
+    │   LeakyReLU                            Conv3x3                  │
+    │        │                                     │                │
+    │        └─────── element-wise add ─────────────┘                 │
+    │                        │                                       │
+    │              Conv_fuse (特征融合)                               │
+    │                        │                                       │
+    │              Final HDRTB (最终重建 F_final)                      │
+    │              (SwinBasedFeatFusionBlock_final_block)             │
+    │                        │                                       │
+    │              Conv3x3 → HR-HSI 输出 (256×256×172)               │
+    │                                                             │
+    │  公式: Y* = F_final(F_spe + F_spa)     （论文公式1）           │
+    └─────────────────────────────────────────────────────────────┘
+    
+    关键组件说明：
+      - **光谱分支**：处理LR-HSI（富含光谱信息但空间分辨率低），通过上采样+HDRTB提取光谱特征 F_spe
+      - **空间分支**：处理HR-MSI（空间分辨率高但波段有限），通过HDRTB提取空间特征 F_spa  
+      - **特征融合**：两分支特征相加后通过卷积融合层得到初步重建结果YFD
+      - **最终重建**：通过额外的HDRTB（使用Swin-based变体）进行精细化重建
+      - LRMSI/HRHSI：分别从HRMSI下采样和LRHSI上采样获得，用于双分支的跨模态信息辅助
+    """
     
     def make_layer(block, n_layers):
         layers = []
@@ -1179,17 +1405,35 @@ class YDCFN(nn.Module):
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
                  use_checkpoint=False, debug=False, hier_win_ratios=[0.5,1,2,4], **kwargs):
+        """初始化HSSDCT双分支融合网络
+        
+        参数说明（对应论文实验设置）：
+          - in_nc/out_nc: 输入/输出光谱波段数，默认172（AVIRIS数据集）
+          - nf: 基础特征通道数（论文中对应特征图通道维度）
+          - in_msi: MSI波段数，默认4（论文实验使用4-band或6-band HR-MSI）
+          - gc: HDRTB中的growth channel数（密集连接中间通道），默认32
+          - img_size: 空间分支输入图像尺寸，默认128
+          - window_size: HDRTB的基础窗口大小，默认(8,8)，实际窗口通过hier_win_ratios缩放
+          - hier_win_ratios: 分层窗口比例，默认[0.5,1,2,4]，
+            对应窗口为base×ratio，如base=(8,8)时得到{(4,4),(8,8),(16,16),(32,32)}
+            论文实验中HDRTB窗口设置为 {4, 8, 16, 16}
+          - mlp_ratio: FFN隐藏层放大倍数，默认4
+        """
         super(YDCFN, self).__init__()
         
-        # Low-resolution HSI processing branch
+        # ==================== 光谱分支 (Spectral Branch) ====================
+        # 处理LR-HSI：富含172个光谱波段，空间分辨率低(64×64)
         self.debug = debug
         in_nc_group = groups
         if in_nc % groups != 0:
             in_nc_group = 1
 
         self.hsiconv1 = nn.Conv2d(in_nc+in_msi, nf*2, 3, 1, 1, bias=True, groups=in_nc_group)
+        # 光谱分支首层卷积：输入为LR-HSI(172ch) + LR-MSI下采样版本(Mm ch)的拼接，输出nf*2通道特征
         self.hsiconvlast = nn.Conv2d(nf*2, nf, 3, 1, 1, bias=True, groups=groups)
+        # 光谱分支末层卷积：将通道数从nf*2降到nf，与空间分支对齐
         self.up = torch.nn.Upsample(scale_factor=2)
+        # 上采样层（×2）：LR-HSI需要两次上采样达到目标分辨率（64→128→256）
         
        
         self.hsifeat = nn.ModuleList()
@@ -1199,11 +1443,18 @@ class YDCFN(nn.Module):
                                  mlp_ratio=mlp_ratio,
                                  drop=drop_rate, value_drop=attn_drop_rate,
                                  drop_path=0, norm_layer=norm_layer,gc=gc, img_size=img_size//2, patch_size=patch_size, hier_win_ratios=hier_win_ratios))
+        # 光谱分支HDRTB堆叠（×2个）：
+        #   每个SwinBasedFeatFusionBlock包含4个HierarchicalTransformerBlock（内含SSCL）
+        #   使用渐进增大的分层窗口进行多尺度光谱-空间特征提取
+        #   dim=nf*2 (较大维度以保留丰富的光谱信息)
 
-        # High-resolution MSI processing branch
+        # ==================== 空间分支 (Spatial Branch) ====================
+        # 处理HR-MSI：空间分辨率高(256×256)，但波段有限(4或6个)
         self.lrelu = nn.LeakyReLU(negative_slope=0.2)
         self.msiconv1 = nn.Conv2d(in_msi+in_nc, nf//2, 3, 1, 1, bias=True)
+        # 空间分支首层卷积：输入为HR-MSI(Mm ch) + LR-HSI上采样版本(172 ch)的拼接，输出nf//2通道
         self.msiconvlast = nn.Conv2d(nf//2, nf, 3, 1, 1, bias=True)
+        # 空间分支末层卷积：将通道数从nf/2提升到nf，与光谱分支对齐
       
         self.msifeat = nn.ModuleList()
         for _ in range(2):
@@ -1212,13 +1463,18 @@ class YDCFN(nn.Module):
                                  mlp_ratio=mlp_ratio,
                                  drop=drop_rate, value_drop=attn_drop_rate,
                                  drop_path=0, norm_layer=norm_layer,gc=gc, img_size=img_size, patch_size=patch_size, hier_win_ratios=hier_win_ratios))
+        # 空间分支HDRTB堆叠（×2个）：
+        #   与光谱分支类似但使用更小的特征维度(nf//2)，因为MSI波段较少
+        #   input_resolution=(4,4)表示在256×256图像上使用更大的等效窗口
 
         self.lrelu = nn.LeakyReLU(negative_slope=0.2)
 
-        # Feature fusion layer
+        # ==================== 特征融合层 (Feature Fusion) ====================
         
         self.conv_fuse = nn.Sequential(nn.Conv2d(nf, out_nc, 3, 1, 1, bias=True, groups=in_nc_group), 
                                      nn.LeakyReLU(negative_slope=0.2, inplace=True))
+        # 融合卷积层：将双分支拼接的nf通道特征映射到out_nc(172)通道
+        # 对应论文公式1中的 F_final 之前的融合操作
 
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
@@ -1258,10 +1514,15 @@ class YDCFN(nn.Module):
                                  mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                                  drop=drop_rate, attn_drop=attn_drop_rate,
                                  drop_path=0, norm_layer=norm_layer,gc=32, img_size=img_size, patch_size=patch_size))
+        # 最终重建HDRTB（F_final）：
+        #   使用SwinBasedFeatFusionBlock_final_block（基于Swin Transformer，支持shifted window）
+        #   对融合后的172通道特征进行精细化重建
+        #   输入维度为out_nc(172)，即直接在全光谱维度上操作
 
         self.norm = norm_layer(self.num_features)
 
         self.last = nn.Conv2d(out_nc, out_nc, 3, 1, 1, bias=False)
+        # 最终重建卷积：3×3无偏置卷积层，生成最终HR-HSI输出
     
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -1281,50 +1542,94 @@ class YDCFN(nn.Module):
         return {"cpb_mlp", "logit_scale", 'relative_position_bias_table'}
 
     def forward(self, lrhsi, hrmsi):
+        """【YDCFN前向传播】执行完整的HSI融合流程（论文 Figure 1）
+        
+        Args:
+            lrhsi: 低分辨率高光谱图像 (B, 172, H/4, W/4)，如 (B, 172, 64, 64)
+            hrmsi: 高分辨率多光谱图像 (B, Mm, H, W)，如 (B, 4, 256, 256)，Mm=4或6
+        
+        Returns:
+            co: 重建的高分辨率高光谱图像 (B, 172, H, W)，如 (B, 172, 256, 256)
+        
+        完整数据流:
+          1. 准备跨模态辅助信息（LR-MSI和HR-HSI）
+          2. 光谱分支：LR-HSI上采样 + HDRTB特征提取 -> F_spe
+          3. 空间分支：HR-MSI + HDRTB特征提取 -> F_spa  
+          4. 特征融合：F_spe + F_spa -> conv_fuse -> YFD
+          5. 最终重建：YFD -> final_blk(HDRTB) -> Conv3x3 -> HR-HSI输出
+        """
+        # ---- Step 1: 准备跨模态辅助信息 ----
+        # 将HRMSI下采样到与LRHSI相同的空间分辨率，作为光谱分支的辅助输入
         lrmsi = torch.nn.functional.interpolate(hrmsi, scale_factor=0.25, mode='bicubic')
+        # 将LRHSI上采样到与HRMSI相同的空间分辨率，作为空间分支的辅助输入
         hrhsi =  torch.nn.functional.interpolate(lrhsi, scale_factor=4, mode='bilinear')
 
+        # ==================== 光谱分支 (Spectral Branch) ====================
+        # 拼接LR-HSI(172ch)和下采样的LR-MSI(Mm ch)作为光谱分支输入
         lrhsi = self.lrelu(self.hsiconv1(torch.cat((lrhsi, lrmsi), 1)))
-
+        # 首次上采样 ×2: 64×64 → 128×128
         lrhsi = self.up(lrhsi)
         x_size = (lrhsi.shape[2], lrhsi.shape[3])
+        # 保存上采样后的特征用于残差连接
         lrhsi2 = lrhsi.clone()
+        # 转换为序列格式以供HDRTB处理 [B, C, H, W] -> [B, H*W, C]
         lrhsi = self.patch_embed(lrhsi)
+        # 通过2个HDRTB进行分层多尺度光谱特征提取
         for ii,layer in enumerate(self.hsifeat):
             lrhsi = layer(lrhsi, x_size)
+        # 转换回图像格式 [B, H*W, C] -> [B, C, H, W]
         lrhsi = self.patch_unembed(lrhsi, x_size)
         
+        # 残差连接：HDRTB提取的特征 + 上采样后的初始特征
         lrhsi = lrhsi + lrhsi2 
+        # 第二次上采样 ×2: 128×128 → 256×256（达到目标分辨率）
         lrhsi = self.up(lrhsi)
         lrhsi = self.lrelu(lrhsi)
+        # 光谱分支末层卷积：通道对齐到nf
         lrhsi = self.hsiconvlast(lrhsi)
 
+        # ==================== 空间分支 (Spatial Branch) ====================
+        # 拼接HR-MSI(Mm ch)和上采样的HR-HSI(172 ch)作为空间分支输入
         hrmsi = self.lrelu(self.msiconv1(torch.cat((hrmsi, hrhsi), 1)))
         x_size = (hrmsi.shape[2], hrmsi.shape[3])
+        # 保存空间分支初始特征用于残差连接
         hrmsi2=hrmsi.clone()
+        # 转换为序列格式以供HDRTB处理
         hrmsi = self.patch_embed(hrmsi)
+        # 通过2个HDRTB进行分层多尺度空间特征提取
         for ii,layer in enumerate(self.msifeat):
             hrmsi = layer(hrmsi, x_size)
         
+        # 残差连接：空间分支HDRTB特征 + 初始特征
         hrmsi = hrmsi2+ self.patch_unembed(hrmsi, x_size)
         hrmsi = self.lrelu(hrmsi)
+        # 空间分支末层卷积：通道对齐到nf
         hrmsi = self.msiconvlast(hrmsi)
 
-        yfd = self.conv_fuse(hrmsi + lrhsi)  # YFD
+        # ==================== 特征融合 (Feature Fusion) ====================
+        # 双分支特征逐元素相加（论文公式1: F_spe + F_spa），然后通过融合卷积层
+        yfd = self.conv_fuse(hrmsi + lrhsi)  # YFD (初步重建的高光谱特征)
         
+        # ==================== 最终重建 (Final Reconstruction F_final) ====================
+        # 通过最终HDRTB进行精细化重建和细节恢复
         x_size = (yfd.shape[2], yfd.shape[3])
         yfd = self.patch_embed(yfd)
         for layer in self.final_blk:
             yfd = layer(yfd, x_size)
         yfd = self.patch_unembed(yfd, x_size)
 
+        # 最终3×3卷积生成HR-HSI输出
         co = self.last(yfd)
         
         return co
     
 
 class HyDCFN(nn.Module):
-    """Hyperspectral Image Fusion Network (HyDCFN).
+    """Hyperspectral Image Fusion Network (HyDCFN) - HSSDCT顶层包装器
+    
+    【论文对应】论文整体框架的顶层封装，负责：
+      1. 管理YDCFN解码器（核心双分支融合网络）
+      2. 训练时对LR-HSI注入AWGN噪声以增强鲁棒性（可选，由snr参数控制）
     
     Main module that combines Swin Transformer-based feature extraction
     with deep convolutional networks for hyperspectral and multispectral
@@ -1333,12 +1638,20 @@ class HyDCFN(nn.Module):
 
     def __init__(self, args):
         super(HyDCFN, self).__init__()
-        self.snr = args.snr
-        self.joint = args.network_mode
+        self.snr = args.snr       # 信噪比(dB)，用于AWGN噪声注入。>0时启用噪声增强训练
+        self.joint = args.network_mode  # 网络模式：0=single, 1=LRHSI+HRMSI(配对), 2=COCNN(三元组)
         
+        # 初始化YDCFN解码器（HSSDCT的核心双分支网络）
         self.decoder = YDCFN(in_nc=args.bands, out_nc=args.bands, nf=args.nf, gc=args.gc, in_msi=args.msi_bands, groups=1, debug=args.DEBUG)
         print('Use the COCNN!')
+        
     def awgn(self, x):
+        """【AWGN噪声注入】Additive White Gaussian Noise（加性高斯白噪声）
+        
+        在训练阶段向LR-HSI添加高斯噪声以提升模型对噪声的鲁棒性。
+        噪声功率由目标SNR决定：noise_power = signal_power / 10^(SNR/10)
+        论文实验中默认SNR=35dB。
+        """
         snr = 10**(self.snr/10.0)
         xpower = torch.sum(x**2)/x.numel()
         npower = torch.sqrt(xpower / snr)
@@ -1346,7 +1659,21 @@ class HyDCFN(nn.Module):
 
 
     def forward(self,LRHSI, HRMSI, mode=0): ### Mode=0, default, mode=1: encode only, mode=2: decoded only
+        """【HyDCFN前向传播】顶层前向传播接口
+        
+        Args:
+            LRHSI: 低分辨率高光谱图像
+            HRMSI: 高分辨率多光谱图像  
+            mode: 运行模式
+              - 0 (default): 正常模式，训练时可能注入AWGN噪声
+              - 1: 仅编码模式
+              - 2: 仅解码模式
+        
+        Returns:
+            重建的高分辨率高光谱图像 (HR-HSI)
+        """
         if self.snr>0 and mode==0 and self.joint==1:
+            # 训练模式下且SNR>0时，向LR-HSI注入AWGN噪声以增强鲁棒性
             LRHSI = self.awgn(LRHSI)
 
         return self.decoder(LRHSI, HRMSI)
