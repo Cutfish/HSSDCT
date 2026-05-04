@@ -105,14 +105,95 @@ class DFE(nn.Module):
         self.linear = nn.Conv2d(in_features, out_features,1,1,0)
 
     def forward(self, x, x_size):
+        """【DFE前向传播】双特征提取：生成富含空间+光谱信息的Q/V表示
         
+        真实调用场景：
+          光谱分支: x=[B, 16384, 160], x_size=(128,128), in_features=160, out_features=160
+          空间分支: x=[B, 65536, 40],  x_size=(256,256), in_features=40,  out_features=40
+        
+        数据流（论文 Figure 4 / Section 2.3）:
+          输入F(序列) → [转Conv2d格式] → conv(空间编码) * linear(光谱编码) → [转回序列] → Q/V输出
+        """
+        # 解包输入张量维度
+        # 光谱分支: [B, 16384, 160];  空间分支: [B, 65536, 40]
         B, L, C = x.shape
+
+        # 解包空间尺寸
+        # 光谱分支: H=128, W=128;   空间分支: H=256, W=256
         H, W = x_size
+
+        # ---- 序列格式 → CNN/Conv2d格式 ----
+        # permute(0,2,1): 将[通道维,空间维]交换位置，从Transformer格式转为CNN格式
+        #   光谱分支: [B, 16384, 160] → [B, 160, 16384]
+        #   空间分支: [B, 65536, 40]  → [B, 40, 65536]
+        #
+        # contiguous(): permute只改stride不搬数据，内存变为non-contiguous
+        #               view()要求物理连续存储，所以必须先拷贝重排
+        #
+        # view(B,C,H,W): 把1D空间维度L拆回2D(H×W)，得到标准4D Conv2d输入
+        #   光谱分支: [B, 160, 16384] → [B, 160, 128, 128]
+        #   空间分支: [B, 40, 65536]  → [B, 40, 256, 256]
         x = x.permute(0, 2, 1).contiguous().view(B, C, H, W)
+        # 光谱分支输出: [B, 160, 128, 128]
+        # 空间分支输出: [B, 40, 256, 256]
+
+        # ---- 双路径门控融合 (论文 Figure 4 的 SSFE 双分支设计) ----
+        # ┌─────────────────── Conv 分支 (局部空间编码) ───────────────────┐
+        # │                                                                 │
+        # │  self.conv = Sequential(                                        │
+        # │    Conv2d(C → C//5, k=1),     ← 1×1降维压缩                    │
+        # │    LeakyReLU(0.2),                                             │
+        # │    Conv2d(C//5 → C//5, k=3,p=1), ← 3×3提取局部空间纹理         │
+        # │    LeakyReLU(0.2),                                             │
+        # │    Conv2d(C//5 → C, k=1)      ← 1×1升维恢复                   │
+        # │  )                                                              │
+        # │                                                                 │
+        # │  光谱分支: [B,160,128,128]                                      │
+        # │    →Conv1x1(→32)→LReLU→[B,32,128,128]                         │
+        # │    →Conv3x3(32→32)→LReLU→[B,32,128,128]  捕获3×3邻域空间细节   │
+        # │    →Conv1x1(→160)→[B,160,128,128]                              │
+        # │                                                                 │
+        # │  空间分支: [B,40,256,256]                                       │
+        # │    →Conv1x1(→8)→LReLU→[B,8,256,256]                           │
+        # │    →Conv3x3(8→8)→LReLU→[B,8,256,256]                           │
+        # │    →Conv1x1(→40)→[B,40,256,256]                                │
+        # └─────────────────────────────────────────────────────────────────┘
+        #                          *
+        # ┌─────────────────── Linear 分支 (全局光谱编码) ─────────────────┐
+        # │                                                                 │
+        # │  self.linear = Conv2d(C → C, k=1)  即逐像素全连接              │
+        # │                                                                 │
+        # │  光谱分支: [B,160,128,128] → Conv1x1(160→160) → [B,160,128,128]│
+        # │            (无激活函数，纯线性变换，建模通道间的全局关系)          │
+        # │                                                                 │
+        # │  空间分支: [B,40,256,256]  → Conv1x1(40→40)   → [B,40,256,256] │
+        # └─────────────────────────────────────────────────────────────────┘
+        #
+        # * : 逐元素相乘 = 门控机制（类似GLU/SwiGLU）
+        #     Linear分支的输出充当"软开关"，选择性通过Conv分支的空间特征
+        #   光谱分支: [B,160,128,128] * [B,160,128,128] → [B,160,128,128]
+        #   空间分支: [B,40,256,256]  * [B,40,256,256]  → [B,40,256,256]
         x = self.conv(x) * self.linear(x)
+        # 光谱分支输出: [B, 160, 128, 128]
+        # 空间分支输出: [B, 40, 256, 256]
+
+        # ---- CNN格式 → 序列格式 (逆转换) ----
+        # view(B, -1, H*W): 将2D空间(H,W)重新压平为1D(L)
+        #   光谱分支: [B,160,128,128] → [B,160,16384]
+        #   空间分支: [B,40,256,256]  → [B,40,65536]
+        #
+        # permute(0,2,1): 恢复Transformer标准格式 [B, 空间位置, 特征通道]
+        #   光谱分支: [B,160,16384] → [B,16384,160]
+        #   空间分支: [B,40,65536]  → [B,65536,40]
+        #
+        # contiguous(): 同上，permute后内存不连续需重排
         x = x.view(B, -1, H*W).permute(0,2,1).contiguous()
+        # 光谱分支输出: [B, 16384, 160]  (= 输入形状)
+        # 空间分支输出: [B, 65536, 40]   (= 输入形状)
 
         return x
+        # 光谱分支返回: [B, 16384, 160]  — 富含空间+光谱信息的Q/V表示
+        # 空间分支返回: [B, 65536, 40]
 
 
 class Mlp(nn.Module):
@@ -290,19 +371,103 @@ class SCC(nn.Module):
         """【SpaSC辅助函数】空间线性投影：将Value特征在窗口内按base_win_size进行空间压缩。
         通过将每个base_window内的token聚合为一个表示，降低V的空间分辨率，
         从而使SpaSC的计算复杂度从O(N^2)降为O(N * N')，其中N' = H'W' << HW（论文公式3）。
+        
+        【调用来源】spatial_self_correlation() 在计算 corr_map = Q @ V^T / scale 前，
+                   先对V进行空间压缩，减少相关性矩阵的列数。
+        
+        【真实输入形状】x 来自 window_partition 后的 V:
+          光谱分支(dim=160,C=80): [256B,   8, 64, 80]   # win=(8,8)时: B'=256B, heads=8, L=64=8×8, C=80
+          空间分支(dim=40,C=40):  [1024B,  5, 64, 40]   # win=(8,8)时: B'=1024B,heads=5, L=64=8×8, C=40
+        
+        【不同窗口大小下的行为】(base_win_size固定为(8,8)):
+          win=(4,4):  不调用此函数(window<base,无需压缩)
+          win=(8,8):  无实际压缩(map==win, 每个base_window=1个token, linear输入维=1→1)
+          win=(16,16): 2×2压缩(每4个token聚合为1个, linear输入维=4→1)
+          win=(32,32): 4×4压缩(每16个token聚合为1个, linear输入维=16→1)
+        
+        【返回值】压缩后的V: [B', num_heads, base_win_area=64, C]
         """
+        # ===== 第1步: 解包输入张量的各个维度 =====
         B, num_h, L, C = x.shape
-        H, W = self.window_size
-        map_H, map_W = self.base_win_size
+        # 光谱分支: B=256B, num_h=8,    L=64(=8×8), C=80
+        # 空间分支: B=1024B,num_h=5,    L=64(=8×8), C=40
+        # 注: L = window_size[0] * window_size[1]，即一个窗口内的token总数
 
-        x = x.view(B, num_h, map_H, H//map_H, map_W, W//map_W, C).permute(0,1,2,4,6,3,5).contiguous().view(B, num_h, map_H*map_W, C, -1)
-        x = self.spatial_linear(x).view(B, num_h, map_H*map_W, C)
+        # ===== 第2步: 获取当前层的窗口尺寸和基础窗口尺寸 =====
+        H, W = self.window_size       # 当前层窗口的高和宽 (总是正方形)
+        map_H, map_W = self.base_win_size  # 基础窗口(8,8)，用于划分压缩单元
+        # win=(8,8):   H,W=8,8     map_H,map_W=8,8      → 每个map_cell包含 1×1=1 个token
+        # win=(16,16): H,W=16,16   map_H,map_W=8,8      → 每个map_cell包含 2×2=4 个token
+        # win=(32,32): H,W=32,32   map_H,map_W=8,8      → 每个map_cell包含 4×4=16个token
+
+        # ===== 第3步: 重塑张量结构，按base_win_size分组 =====
+        # 将L=H×W的序列展成2D网格，再按base_win_size划分为子区域
+        x = x.view(B, num_h, map_H, H//map_H, map_W, W//map_W, C)
+        # view后形状(以win=(16,16)为例):
+        #   [256B, 8, 8, 2, 8, 2, 80]
+        #         ↑   ↑   ↑   ↑  ↑
+        #         |   |   |   |  └─ C通道(不变)
+        #         |   |   |   └──── W方向上每个map_cell内的分块数 = W//map_W = 16//8 = 2
+        #         |   |   └──────── map_W方向的格子数 = 8
+        #         |   └──────────── H方向上每个map_cell内的分块数 = H//map_H = 16//8 = 2
+        #         └──────────────── map_H方向的格子数 = 8
+        #
+        # win=(8,8)时: [256B, 8, 8, 1, 8, 1, 80]  (无实际分组，每组只有1个token)
+        # win=(32,32)时:[256B, 8, 8, 4, 8, 4, 80]  (4×4分组，每组16个token)
+
+        # ===== 第4步: 调整维度顺序，把需要聚合的维度放到最后 =====
+        x = x.permute(0, 1, 2, 4, 6, 3, 5)
+        # permute后形状(win=(16,16)):
+        #   [256B, 8, 8, 8, 80, 2, 2]
+        #         ↑   ↑  ↑  ↑  ↑   ↑  ↑
+        #         |   |  |  |  |   |  └─ W方向分块索引(要聚合)
+        #         |   |  |  |  |   └──── H方向分块索引(要聚合)
+        #         |   |  |  |  └──────── C通道
+        #         |   |  |  └─────────── map_W格子数
+        #         |   |  └────────────── map_H格子数
+        #         |   └───────────────── num_heads
+        #         └───────────────────── B'(batch of windows)
+
+        # ===== 第5步: 保证内存连续并展平最后两个聚合维度 =====
+        x = x.contiguous().view(B, num_h, map_H * map_W, C, -1)
+        # contiguous(): permute后内存不连续，必须调用才能view()
+        # 最后维度 -1 自动推断 = (H//map_H) * (W//map_W)，即每个map_cell内的token数量
+        # view后形状:
+        #   win=(8,8):   [256B, 8, 64, 80, 1]     # 64=8×8个map_cell, 每个1个token
+        #   win=(16,16): [256B, 8, 64, 80, 4]     # 64=8×8个map_cell, 每个4个token(2×2)
+        #   win=(32,32): [256B, 8, 64, 80, 16]    # 64=8×8个map_cell, 每个16个token(4×4)
+
+        # ===== 第6步: 线性投影聚合 —— 核心压缩操作 =====
+        x = self.spatial_linear(x)
+        # spatial_linear = nn.Linear(in_features=(H*W)//(map_H*map_W), out_features=1)
+        # 对最后一个维度做线性变换: 将每个map_cell内的K个token聚合为1个表示
+        #   win=(8,8):   Linear(1→1): [256B, 8, 64, 80, 1]   → 实际上是恒等映射(或轻微变换)
+        #   win=(16,16): Linear(4→1): [256B, 8, 64, 80, 4]   → [256B, 8, 64, 80, 1]  (4合1)
+        #   win=(32,32): Linear(16→1):[256B, 8, 64, 80, 16]  → [256B, 8, 64, 80, 1]  (16合1)
+        # 
+        # 【作用】可学习的聚合函数: 将base_window区域内所有token的特征加权求和为一个向量
+        #         类似于局部池化操作，但是可训练的参数化版本
+
+        # ===== 第7步: 去掉多余的维度，返回压缩结果 =====
+        x = x.view(B, num_h, map_H * map_W, C)
+        # 去掉最后长度为1的维度
+        # 最终返回形状(两种分支):
+        #   光谱分支: [256B,   8, 64, 80]   # 64=8×8=base_win_area, C=dim/2=80
+        #   空间分支: [1024B,  5, 64, 40]   # 64=8×8=base_win_area, C=dim/2=40
+        #
+        # ★ 关键: 输出的第3维恒为 base_win_area(64)，与原始window_size无关!
+        #   这就是"空间压缩"的含义: 无论原始窗口多大，都压缩到base_win_size的粒度
         return x
     
     def spatial_self_correlation(self, q, v):
         """【SSCL - SpaSC】空间自相关 (Spatial Self-Correlation)
         
         【论文对应】论文 Section 2.3 公式(3): SpaSC(Q,V) = (QV^T / sqrt(d)) * V
+        
+        真实调用场景：
+          光谱分支: q,v=[256B, 8, 64, 10], dim=160, win=(8,8), base_win=(8,8)
+          空间分支: q,v=[1024B, 5, 64, 4], dim=40, win=(8,8), base_win=(8,8)
+          (当win>base时: 如win=(16,16),base=(8,8)，V被压缩)
         
         在分层窗口内，通过将Query与空间压缩后的Value token进行相关性计算，
         实现高效的长程空间上下文建模。关键步骤：
@@ -314,45 +479,163 @@ class SCC(nn.Module):
         这种设计避免了标准自注意力的二次复杂度，使得可以使用更大的分层窗口。
         """
         
+        # ---- Step 1: 解包输入形状 ----
+        # 光谱分支: B=256B(256个窗×batch), num_head=8, L=64(=8×8), C=10(head_dim)
+        # 空间分支: B=1024B(1024个窗×batch), num_head=5, L=64(=8×8), C=4(head_dim)
         B, num_head, L, C = q.shape
 
-        # spatial projection: 将V从 [B, head, HW, C] 压缩到 [B, head, H'W', C]
+        # ---- Step 2: V的空间压缩投影（核心降复杂度操作）----
+        # 将每个窗口内的Value从L个token压缩到H'W'个token
+        # 内部流程:
+        #   将[wh,ww]的窗口按[map_H,map_W]划分为子区域，每区域聚合为一个token
+        #   通过Linear层加权求和实现聚合
+        #
+        # 【5种窗口大小对应的压缩行为】(base_win_size=(8,8)为全局基准):
+        #
+        # ① win=(4,4) < base:  self.base_win_size=min(4,8)=(4,4) → win==base, 无实际压缩
+        #    L=16, Linear(1→1): 每个token独立，形状不变
+        #    光谱分支: [1024B,8,16,80] → [1024B,8,16,80] (16=4×4)
+        #    空间分支: [4096B,5,16,40] → [4096B,5,16,40] (16=4×4)
+        #
+        # ② win=(8,8) == base: 压缩比=1，无实际压缩
+        #    L=64, Linear(1→1): 每个token独立，形状不变
+        #    光谱分支: [256B,8,64,80] → [256B,8,64,80] (64=8×8)
+        #    空间分支: [1024B,5,64,40] → [1024B,5,64,40] (64=8×8)
+        #
+        # ③ win=(16,16) > base: 压缩比=4x (每2×2的4个token聚合为1个)
+        #    L=256→64, Linear(4→1)
+        #    光谱分支: [256B,8,256,80] → [256B,8,64,80]
+        #    空间分支: [1024B,5,256,40] → [1024B,5,64,40]
+        #
+        # ④ win=(32,32) > base: 压缩比=16x (每4×4的16个token聚合为1个)
+        #    L=1024→64, Linear(16→1)
+        #    光谱分支: [16B,8,1024,80] → [16B,8,64,80]
+        #    空间分支: [64B,5,1024,40] → [64B,5,64,40]
+        #
+        # ★ 核心结论: 输出第3维恒为 self.base_win_size的面积!
+        #   win≥(8,8)时: base=(8,8), 输出L=64
+        #   win=(4,4)时: base=(4,4), 输出L=16
         v = self.spatial_linear_projection(v)
+        # ★ 注意: 以下输出形状随window_size而变化! (以光谱分支为例)
+        #   win=(4,4):  [1024B, 8,  16, 80]   # base=(4,4), L=4×4=16
+        #   win=(8,8):  [256B,  8,  64, 80]   # base=(8,8), L=8×8=64
+        #   win=(16,16):[256B,  8,  64, 80]   # base=(8,8), L=8×8=64 (压缩后)
+        #   win=(32,32):[16B,    8,  64, 80]   # base=(8,8), L=8×8=64 (压缩后)
+        #
+        # 空间分支同理(C=40):
+        #   win=(4,4):  [4096B, 5, 16, 40]
+        #   win=(8,8):  [1024B, 5, 64, 40]
+        #   win=(16,16):[1024B, 5, 64, 40]
+        #   win=(32,32):[64B,   5, 64, 40]
 
-        # compute correlation map: Q(V')^T / sqrt(d)，对应论文公式(3)中的 QV^T/sqrt(d)
+        # ---- Step 3: 计算相关性图 corr_map = Q @ V^T / scale ----
+        # transpose(-2,-1): 将V的最后两维转置 [B',head,C,L'] 用于矩阵乘法
+        #   光谱分支: [256B,8,64,10] → [256B,8,10,64]
+        #   空间分支: [1024B,5,64,4] → [1024B,5,4,64]
+        #
+        # q @ v^T: 批量矩阵乘法，计算Query与压缩后Value的相关性
+        #   光谱分支: [256B,8,64,10] @ [256B,8,10,64] → [256B, 8, 64, 64]
+        #             (64个token对64个token的相关性分数)
+        #   空间分支: [1024B,5,64,4] @ [1024B,5,4,64] → [1024B, 5, 64, 64]
+        #
+        # / self.scale: 缩放因子防止数值过大 (scale=head_dim)
+        #   光谱分支: /sqrt(10);  空间分支: /sqrt(4)=/2
         corr_map = (q @ v.transpose(-2,-1)) / self.scale
+        # 光谱分支输出: [256B, 8, 64, 64]   (相关性图: 64×64亲和力矩阵)
+        # 空间分支输出: [1024B, 5, 64, 64]
 
-        # add relative position bias - 添加动态相对位置偏置以编码空间位置信息
-        # generate mother-set: 生成完整的相对位置坐标网格
-        position_bias_h = torch.arange(1 - self.H_sp, self.H_sp, device=v.device)
-        position_bias_w = torch.arange(1 - self.W_sp, self.W_sp, device=v.device)
-        biases = torch.stack(torch.meshgrid(position_bias_h, position_bias_w, indexing='ij'))
-        rpe_biases = biases.flatten(1).transpose(0, 1).contiguous().float()
-        pos = self.pos(rpe_biases)
+        # ---- Step 4: 添加动态相对位置偏置 (DynamicPosBias) ----
+        # 目的: 让模型知道"token之间的距离"，相同内容在不同位置应有不同权重
+        
+        # 4a. 生成位置坐标的mother-set（所有可能的相对位置坐标）
+        # arange: 产生 [-H_sp+1, ..., H_sp-1] 的坐标范围
+        #   光谱/空间分支(win=8): H_sp=8 → [-7, -6, ..., 0, ..., 6, 7], 长度15
+        position_bias_h = torch.arange(1 - self.H_sp, self.H_sp, device=v.device)    # 长度: 2*H_sp-1=15
+        position_bias_w = torch.arange(1 - self.W_sp, self.W_sp, device=v.device)    # 长度: 2*W_sp-1=15
+        
+        # meshgrid + stack: 生成2D坐标网格，shape=[2, 15, 15]
+        biases = torch.stack(torch.meshgrid(position_bias_h, position_bias_w, indexing='ij'))  # [2, 15, 15]
+        
+        # flatten+transpose: 转为坐标点列表 shape=[N_pos, 2]，每个元素是(dy,dx)
+        #   225个可能的相对位置坐标 (15×15)
+        rpe_biases = biases.flatten(1).transpose(0, 1).contiguous().float()  # [225, 2]
+        
+        # pos网络: MLP(Linear→LN→ReLU→Linear→LN→ReLU→Linear→LN→ReLU→Linear→heads)
+        # 将2D坐标映射为num_heads维的位置偏置向量
+        #   光谱分支: [225, 2] → [225, 8]
+        #   空间分支: [225, 2] → [225, 5]
+        pos = self.pos(rpe_biases)  # [225, num_heads]
 
-        # select position bias - 根据窗口内token的相对位置索引选择对应的位置偏置
-        coords_h = torch.arange(self.H_sp, device=v.device)
-        coords_w = torch.arange(self.W_sp, device=v.device)
-        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing='ij'))
-        coords_flatten = torch.flatten(coords, 1)
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
-        relative_coords[:, :, 0] += self.H_sp - 1
-        relative_coords[:, :, 1] += self.W_sp - 1
-        relative_coords[:, :, 0] *= 2 * self.W_sp - 1
-        relative_position_index = relative_coords.sum(-1)
+        # 4b. 为当前窗口内的每对token选择对应的位置偏置
+        # 生成绝对坐标网格: coords_h=[0..7], coords_w=[0..7]
+        coords_h = torch.arange(self.H_sp, device=v.device)  # [8]: [0,1,2,...,7]
+        coords_w = torch.arange(self.W_sp, device=v.device)  # [8]: [0,1,2,...,7]
+        
+        # meshgrid: 生成2D坐标网格 shape=[2, 8, 8]
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing='ij'))  # [2, 8, 8]
+        
+        # flatten: 展平为64个位置的坐标列表 shape=[2, 64]
+        coords_flatten = torch.flatten(coords, 1)  # [2, 64]
+        
+        # 计算所有token对的相对坐标 (广播相减)
+        # [:,:,None]→[2,64,1] 减 [:,None,:]→[2,1,64] → [2,64,64]
+        # relative_coords[b,i,j] = 第j个token相对于第i个token的(dh,dw)偏移量
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # [2, 64, 64]
+        
+        # permute: 调整为[token_i, token_j, (dh,dw)]格式
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # [64, 64, 2]
+        
+        # 将相对坐标从[-7,+7]偏移到[0,14]的非负索引范围 (方便查表)
+        #   dh: 加(H_sp-1)=7 → [-7..7] → [0..14]
+        #   dw: 加(W_sp-1)=7 → [-7..7] → [0..14]
+        relative_coords[:, :, 0] += self.H_sp - 1  # [64, 64, 0] += 7
+        relative_coords[:, :, 1] += self.W_sp - 1  # [64, 64, 1] += 7
+        
+        # 将2D索引展平为1D: idx = dh * (2*W-1) + dw
+        #   2*W_sp-1=15, 最终idx范围 [0, 224] (共225个值)
+        relative_coords[:, :, 0] *= 2 * self.W_sp - 1  # [64, 64, 0] *= 15
+        relative_position_index = relative_coords.sum(-1)  # [64, 64] 整数索引
+        
+        # 用索引从pos表中选择对应的位置偏置
+        # view reshape: [64, 64] → [64, base_h, 64/base_h, base_w, 64/base_w, num_heads]
+        #   光谱分支(base=(8,8)): [64, 8, 8, 1, 8, 1, 8]
+        #   即 [Wh*Ww, bh, Wh/bh, bw, Ww/bw, nH] = [64, 8, 8, 1, 8, 1, 8]
         relative_position_bias = pos[relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.base_win_size[0], self.window_size[0]//self.base_win_size[0], self.base_win_size[1], self.window_size[1]//self.base_win_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+            self.window_size[0]*self.window_size[1], self.base_win_size[0],
+            self.window_size[0]//self.base_win_size[0], self.base_win_size[1],
+            self.window_size[1]//self.base_win_size[1], -1)
+        # 光谱分支: [64, 8, 8, 1, 8, 1, 8];  空间分支: [64, 8, 8, 1, 8, 1, 5]
+        
+        # permute+view: 重排维度并取均值，得到最终位置偏置 [num_heads, L, L']
+        #   光谱分支: → [8, 64, 64]
+        #   空间分支: → [5, 64, 64]
         relative_position_bias = relative_position_bias.permute(0,1,3,5,2,4).contiguous().view(
-            self.window_size[0] * self.window_size[1], self.base_win_size[0]*self.base_win_size[1], self.num_heads, -1).mean(-1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous() 
+            self.window_size[0]*self.window_size[1], self.base_win_size[0]*self.base_win_size[1], self.num_heads, -1).mean(-1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        # 光谱分支输出: [8, 64, 64];  空间分支输出: [5, 64, 64]
+        
+        # 将位置偏置加到相关性图上 (unsqueeze(0)添加batch维度)
+        #   光谱分支: [256B,8,64,64] + [1,8,64,64] → [256B,8,64,64]
+        #   空间分支: [1024B,5,64,64] + [1,5,64,64] → [1024B,5,64,64]
         corr_map = corr_map + relative_position_bias.unsqueeze(0)
 
-        # transformation: 通过相关性图对V加权，得到空间自相关输出
+        # ---- Step 5: 通过相关性图对V加权，得到空间自相关输出 ----
+        # Dropout正则化 (训练时随机置零部分Value)
+        # 形状不变: 光谱分支[256B,8,64,10]; 空间分支[1024B,5,64,4]
         v_drop = self.value_drop(v)
-        x = (corr_map @ v_drop).permute(0,2,1,3).contiguous().view(B, L, -1) 
+        
+        # corr_map @ V': 相关性图作为权重对压缩后的V加权聚合
+        #   光谱分支: [256B,8,64,64] @ [256B,8,64,10] → [256B, 8, 64, 10]
+        #   空间分支: [1024B,5,64,64] @ [1024B,5,64,4] → [1024B, 5, 64, 4]
+        x = (corr_map @ v_drop).permute(0,2,1,3).contiguous().view(B, L, -1)
+        # permute(0,2,1,3): [B', head, L, C] → [B', L, head, C]
+        # view(B, L, -1): 合并head和C维度
+        #   光谱分支: [256B,8,64,10] → [256B,64,80]  (8头×10dim=80=C/2)
+        #   空间分支: [1024B,5,64,4] → [1024B,64,20]  (5头×4dim=20=C/2)
 
         return x
+        # 光谱分支返回: [256B, 64, 80]   (通道减半: 160/2=80)
+        # 空间分支返回: [1024B, 64, 20] (通道减半: 40/2=20)
     
     def channel_self_correlation(self, q, v):
         """【SSCL - SpeSC】光谱/通道自相关 (Spectral Self-Correlation)
@@ -385,37 +668,152 @@ class SCC(nn.Module):
     def forward(self, x):
         """【SSCL前向传播】完整执行空间-光谱相关层计算流程
         
+        真实调用场景：
+          光谱分支: x=[B, 128, 128, 160], dim=160, win=(8,8), num_heads=8
+          空间分支: x=[B, 256, 256, 40],  dim=40,  win=(8,8), num_heads=5
+        
         数据流（对应论文 Figure 4）:
           Input F -> [SSFE/DFE] -> Q,V -> [Split] -> Q,V (各半通道)
             -> [SpaSC分支] -> x_spatial (C/2维)
             -> [SpeSC分支] -> x_channel (C/2维)
             -> [Concat] -> [SSFA/Linear proj] -> Output
         """
-        xB,xH,xW,xC = x.shape
-        qv = self.qv(x.view(xB,-1,xC), (xH,xW)).view(xB, xH, xW, xC)
-        # window partition
+        # ---- Step 0: 解包输入形状 ----
+        # 光谱分支: [B, 128, 128, 160];  空间分支: [B, 256, 256, 40]
+        xB, xH, xW, xC = x.shape
+
+        # ---- Step 1: SSFE/DFE 双特征提取，生成Q和V表示 ----
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ DFE内部流程（self.qv）:                                           │
+        # │   输入: x.view(xB,-1,xC)=[xB, xH*xW, xC]                          │
+        # │     光谱分支: [B, 16384, 160]                                      │
+        # │     空间分支: [B, 65536, 40]                                       │
+        # │                                                                  │
+        # │   permute+view转Conv2d格式: [B, C, H, W]                           │
+        # │     光谱分支: [B, 160, 128, 128]                                   │
+        # │     空间分支: [B, 40, 256, 256]                                    │
+        # │                                                                  │
+        # │   卷积分支(conv):                                                  │
+        # │     光谱分支: Conv2d(160→32)→LReLU→3×3(32→32)→LReLU→Conv2d(32→160)│
+        # │       输出: [B, 160, 128, 128]                                     │
+        # │     空间分支: Conv2d(40→8)→LReLU→3×3(8→8)→LReLU→Conv2d(8→40)      │
+        # │       输出: [B, 40, 256, 256]                                      │
+        # │                                                                  │
+        # │   线性分支(linear):                                                │
+        # │     光谱分支: Conv2d(160→160, k=1) → [B, 160, 128, 128]           │
+        # │     空间分支: Conv2d(40→40, k=1)   → [B, 40, 256, 256]            │
+        # │                                                                  │
+        # │   融合: conv * linear（逐元素相乘，门控融合）                       │
+        # │     光谱分支: [B, 160, 128, 128]                                   │
+        # │     空间分支: [B, 40, 256, 256]                                    │
+        # │                                                                  │
+        # │   reshape回序列格式并view为图像格式:                                │
+        # │     光谱分支: [B, 128, 128, 160]                                   │
+        # │     空间分支: [B, 256, 256, 40]                                    │
+        # └──────────────────────────────────────────────────────────────────┘
+        qv = self.qv(x.view(xB, -1, xC), (xH, xW)).view(xB, xH, xW, xC)
+        # 先转换为token格式，然后经过SSFE处理之后再转换为图片格式
+        # 光谱分支输出: [B, 128, 128, 160]
+        # 空间分支输出: [B, 256, 256, 40]
+
+        # ---- Step 2: Window Partition 划分非重叠窗口 ----
+        # 将特征图按window_size划分为局部窗口，每个窗口内独立计算相关性
+        # 光谱分支(win=(8,8)): [B, 128, 128, 160] → [B*(16*16), 8, 8, 160] = [256B, 8, 8, 160]
+        #   其中 128/8=16, 共16×16=256个窗口
+        # 空间分支(win=(8,8)): [B, 256, 256, 40]  → [B*(32*32), 8, 8, 40]  = [1024B, 8, 8, 40]
+        #   其中 256/8=32, 共32×32=1024个窗口
         qv = window_partition(qv, self.window_size)
+
+        # 将每个窗口展平为序列: [num_win*B, wh*ww, C]
+        # 光谱分支: [256B, 64, 160]  (64=8*8)
+        # 空间分支: [1024B, 64, 40] (64=8*8)
         qv = qv.view(-1, self.window_size[0]*self.window_size[1], xC)
 
-        # qv splitting
+        # ---- Step 3: QV 分割 —— 将特征沿通道维均分为Q和V两部分 ----
+        # 解包当前形状
+        # 光谱分支: B'=256B, L=64, C=160
+        # 空间分支: B'=1024B, L=64, C=40
         B, L, C = qv.shape
-        qv = qv.view(B, L, 2, self.num_heads, C // (2*self.num_heads)).permute(2,0,3,1,4).contiguous()
-        q, v = qv[0], qv[1]  # B, num_heads, L, C//num_heads
 
-        # spatial self-correlation (S-SC)
+        # reshape为多头格式: [B', L, 2, num_heads, head_dim]
+        # head_dim = C // (2 * num_heads)
+        #   光谱分支: head_dim = 160 // 16 = 10; 形状: [256B, 64, 2, 8, 10]
+        #   空间分支: head_dim = 40 // 10 = 4;   形状: [1024B, 64, 2, 5, 4]
+        qv = qv.view(B, L, 2, self.num_heads, C // (2*self.num_heads))
+
+        # permute将Q/V维度提到最前: [2, B', num_heads, L, head_dim]
+        # 光谱分支: [2, 256B, 8, 64, 10]
+        # 空间分支: [2, 1024B, 5, 64, 4]
+        qv = qv.permute(2, 0, 3, 1, 4).contiguous()
+
+        # 分离为Q和V
+        # 光谱分支: q=v=[256B, 8, 64, 10]
+        # 空间分支: q=v=[1024B, 5, 64, 4]
+        q, v = qv[0], qv[1]  # [B, num_heads, L, head_dim]
+
+        # ---- Step 4: SpaSC 空间自相关 (论文公式3) ----
+        # 公式: SpaSC(Q,V) = (Q @ V_compressed^T / sqrt(d)) * V_compressed
+        # 内部流程:
+        #   ① spatial_linear_projection: 将V从[L,head_d]压缩到[H'W',head_d]
+        #      光谱分支: V从[256B,8,64,10]压缩到[256B,8,64,10] (win==base_win时不变)
+        #      若win>base: 如win=(16,16),base=(8,8)则V从[256B,8,256,10]压缩到[256B,8,64,10] (4×4→1)
+        #   ② corr_map = Q @ V^T / scale
+        #      光谱分支: [256B,8,64,10] @ [256B,8,10,64] / sqrt(10) → [256B, 8, 64, 64]
+        #   ③ 添加DynamicPosBias动态相对位置偏置
+        #   ④ corr_map @ V → 空间加权输出
+        #
+        # 输出: [B', L, C/2] （通道减半，因为空间相关只产生一半特征）
+        # 光谱分支: [256B, 64, 80]   (80=160/2)
+        # 空间分支: [1024B, 64, 20]  (20=40/2)
         x_spatial = self.spatial_self_correlation(q, v)
+
+        # reshape回窗口格式以便后续merge
+        # 光谱分支: [256B, 64, 80] → [256B, 8, 8, 80]
+        # 空间分支: [1024B, 64, 20] → [1024B, 8, 8, 20]
         x_spatial = x_spatial.view(-1, self.window_size[0], self.window_size[1], C//2)
-        x_spatial = window_reverse(x_spatial, (self.window_size[0],self.window_size[1]), xH, xW)  # xB xH xW xC
 
-        # channel self-correlation (C-SC)
+        # window_reverse: 合并窗口恢复完整特征图
+        # 光谱分支: [256B, 8, 8, 80] → [B, 128, 128, 80]
+        # 空间分支: [1024B, 8, 8, 20] → [B, 256, 256, 20]
+        x_spatial = window_reverse(x_spatial, (self.window_size[0],self.window_size[1]), xH, xW)
+
+        # ---- Step 5: SpeSC 光谱/通道自相关 (论文公式4) ----
+        # 公式: SpeSC(Q,V) = (Q^T @ V / HW) * V^T
+        # 内部流程:
+        #   ① 单头策略: 将所有头的Q/V在通道维拼接
+        #      光谱分支: [256B,8,64,10]→permute→[256B,64,80] (8头×10dim=80ch)
+        #      空间分支: [1024B,5,64,4] →permute→[1024B,64,20](5头×4dim=20ch)
+        #   ② corr_map = Q^T @ V / L (L=HW=64, 空间token数)
+        #      光谱分支: [256B,80,64] @ [256B,64,20] / 64 → [256B, 80, 20]
+        #   ③ corr_map @ V^T → 通道级加权输出
+        #      [256B, 80, 20] @ [256B, 20, 64] → [256B, 80, 64]
+        #
+        # 输出: [B', L, C/2] （与SpaSC互补的另一半光谱特征）
+        # 光谱分支: [256B, 64, 80]
+        # 空间分支: [1024B, 64, 20]
         x_channel = self.channel_self_correlation(q, v)
-        x_channel = x_channel.view(-1, self.window_size[0], self.window_size[1], C//2)
-        x_channel = window_reverse(x_channel, (self.window_size[0], self.window_size[1]), xH, xW) # xB xH xW xC
 
-        # spatial-channel information fusion
+        # reshape + window_reverse (同SpaSC)
+        # 光谱分支: [256B, 64, 80] → [256B, 8, 8, 80] → [B, 128, 128, 80]
+        # 空间分支: [1024B, 64, 20] → [1024B, 8, 8, 20] → [B, 256, 256, 20]
+        x_channel = x_channel.view(-1, self.window_size[0], self.window_size[1], C//2)
+        x_channel = window_reverse(x_channel, (self.window_size[0], self.window_size[1]), xH, xW)
+
+        # ---- Step 6: SSFA 空间-光谱特征聚合 ----
+        # 拼接两个互补的特征（通道维拼接，恢复原始通道数）
+        # 光谱分支: cat([B,128,128,80], [B,128,128,80], dim=-1) → [B, 128, 128, 160]
+        # 空间分支: cat([B,256,256,20], [B,256,256,20], dim=-1) → [B, 256, 256, 40]
         x = torch.cat([x_spatial, x_channel], -1)
+
+        # Linear投影 + Dropout: 最终的特征变换和正则化
+        # proj = nn.Linear(dim, dim)，将融合后的特征线性映射
+        # 光谱分支: Linear(160→160): [B, 128, 128, 160] → [B, 128, 128, 160]
+        # 空间分支: Linear(40→40):   [B, 256, 256, 40]  → [B, 256, 256, 40]
         x = self.proj_drop(self.proj(x))
 
+        # 返回SSCL最终输出（与输入形状一致）
+        # 光谱分支: [B, 128, 128, 160]
+        # 空间分支: [B, 256, 256, 40]
         return x
 
     def extra_repr(self) -> str:
@@ -480,6 +878,13 @@ class HierarchicalTransformerBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def check_image_size(self, x, win_size):
+        #   1. permute(0,3,1,2): [B,H,W,C] → [B,C,H,W]（Conv2d格式）
+        #   2. 计算mod_pad_h = (win_h - H%win_h) % win_h（需要填充的高度）
+        #   3. 计算mod_pad_w = (win_w - W%win_w) % win_w（需要填充的宽度）
+        #   4. F.pad(..., 'reflect'): reflect模式边缘反射填充
+        #   5. permute(0,2,3,1): [B,C,H+ph,W+pw] → [B,H+ph,W+pw,C]
+        # 示例: H=128,W=128,win=(8,16) → 128%8=0,128%16=0 → 无需填充
+        #       H=126,W=130,win=(8,16) → pad_h=(8-126%8)%8=6, pad_w=(16-130%16)%16=6
         x = x.permute(0,3,1,2).contiguous()
         _, _, h, w = x.size()
         mod_pad_h = (win_size[0] - h % win_size[0]) % win_size[0]
@@ -491,6 +896,18 @@ class HierarchicalTransformerBlock(nn.Module):
     def forward(self, x, x_size, win_size):
         """【HDRTB子块前向传播】执行单层分层Transformer计算
         
+        真实调用场景：
+          光谱分支: x=[B, 16384, 160], x_size=(128,128), win_size=(4,4)/(8,8)/(16,16)/(32,32)
+          空间分支: x=[B, 65536, 40],  x_size=(256,256), win_size=(4,4)/(8,8)/(16,16)/(32,32)
+        
+        Args:
+            x: 输入序列特征
+            x_size: 原始图像空间尺寸
+            win_size: 当前层窗口大小（恒为正方形）
+        
+        Returns:
+            x: 输出序列特征，形状与输入相同
+        
         流程: 
           1. 将序列特征reshape为2D特征图
           2. padding确保尺寸能被window_size整除
@@ -501,28 +918,97 @@ class HierarchicalTransformerBlock(nn.Module):
         
         对应论文 Figure 2 中 SSCL 内部的 iLayerNorm -> SSCL -> MLP 结构。
         """
+        # 解包空间尺寸
+        # 光谱分支: x_size=(128,128) → H=128, W=128
+        # 空间分支: x_size=(256,256) → H=256, W=256
         H, W = x_size
-        B, L, C = x.shape
-        shortcut = x
-        x = x.view(B, H, W, C)
-        
-        # padding
-        x = self.check_image_size(x, win_size)
-        _, H_pad, W_pad, _ = x.shape # shape after padding
-        x = self.correlation(x) 
 
-        # unpad
+        # 解包输入张量形状
+        # 光谱分支: [B, 16384, 160] → B=B, L=16384(=128*128), C=160(=nf*2)
+        # 空间分支: [B, 65536, 40]  → B=B, L=65536(=256*256), C=40 (=nf//2)
+        B, L, C = x.shape
+
+        # 保存输入用于残差连接（浅拷贝引用）
+        # 光谱分支: [B, 16384, 160]
+        # 空间分支: [B, 65536, 40]
+        shortcut = x
+
+        # 将序列格式 reshape 为2D特征图格式（用于窗口操作）
+        # 光谱分支: [B, 16384, 160] → [B, 128, 128, 160]
+        # 空间分支: [B, 65536, 40]  → [B, 256, 256, 40]
+        x = x.view(B, H, W, C)
+
+        # ---- Padding：确保空间尺寸能被win_size整除（窗口操作要求）----
+        # check_image_size内部流程：
+        #   permute→计算pad量→reflect padding→permute还原
+        # 示例: H=128,W=128,win=(8,8) → 128%8=0无需padding → 形状不变
+        #       H=130,W=126,win=(8,8) → pad_h=6,pad_w=2 → [B,136,128,C]
+        # 光谱分支: [B, 128, 128, 160] → 通常无padding → [B, 128, 128, 160]
+        # 空间分支: [B, 256, 256, 40]  → 通常无padding → [B, 256, 256, 40]
+        x = self.check_image_size(x, win_size)
+
+        # 记录padding后的实际尺寸（供unpad使用）
+        # 通常H_pad==H, W_pad==W（因为128和256都是8的倍数）
+        _, H_pad, W_pad, _ = x.shape
+
+        # SCC/SSCL：核心的空间-光谱相关性计算（论文Section 2.3, 公式3&4）
+        # 内部执行：SSFE(Q,V生成) → SpaSC(空间自相关) + SpeSC(通道自相关) → SSFA融合
+        # 输入/输出形状不变（SCC内部保持[H,W,C]格式）
+        # 光谱分支: [B, 128, 128, 160] → [B, 128, 128, 160]
+        # 空间分支: [B, 256, 256, 40]  → [B, 256, 256, 40]
+        x = self.correlation(x)
+
+        # ---- Unpad：去除之前添加的padding，恢复原始空间分辨率 ----
+        # 切片截取前H行、前W列，contiguous()保证内存连续
+        # 光谱分支: [B, 128, 128, 160] → [B, 128, 128, 160]
+        # 空间分支: [B, 256, 256, 40]  → [B, 256, 256, 40]
         x = x[:, :H, :W, :].contiguous()
 
-        # norm
+        # ---- LayerNorm（Post-Norm风格：先变换再归一化）----
+        # Step1: reshape回序列格式
+        # 光谱分支: [B, 128, 128, 160] → [B, 16384, 160]
+        # 空间分支: [B, 256, 256, 40]  → [B, 65536, 40]
         x = x.view(B, H * W, C)
+
+        # Step2: LayerNorm在最后一个维度(C维)上归一化
+        # norm1=LayerNorm(C)，对每个patch的特征向量做归一化（均值0方差1后仿射变换）
+        # 光谱分支: [B, 16384, 160] → [B, 16384, 160]
+        # 空间分支: [B, 65536, 40]  → [B, 65536, 40]
         x = self.norm1(x)
 
-        # FFN
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.norm2(self.mlp(x)))
+        # ---- 第一个残差连接：shortcut + drop_path(SSCL输出) ----
+        # drop_path: 随机深度正则化（训练时以drop_path概率置零，推理时恒等映射）
+        # 光谱分支: [B,16384,160] + [B,16384,160] → [B, 16384, 160]
+        # 空间分支: [B,65536,40]  + [B,65536,40]  → [B, 65536, 40]
+        x = shortcut + self.drop_path(x)  # 残差连接①
 
-        return x
+        # ---- FFN (Feed-Forward Network / MLP) 子层 ----
+        # 完整流程: mlp(fc1→GELU→drop→fc2→drop) → norm2 → drop_path → 残差相加
+        # ┌────────────────────────────────────────────────────────────┐
+        # │ mlp内部结构（Mlp类）：                                       │
+        # │   光谱分支: fc1=Linear(160→640), fc2=Linear(640→160)      │
+        # │   空间分支: fc1=Linear(40→160),  fc2=Linear(160→40)       │
+        # │   hidden_dim = dim * mlp_ratio = dim * 4                   │
+        # │                                                              │
+        # │ 光谱分支数据流:                                               │
+        # │   [B,16384,160] → fc1 → [B,16384,640] → GELU              │
+        # │   → [B,16384,640] → fc2 → [B,16384,160] → drop           │
+        # │                                                              │
+        # │ 空间分支数据流:                                               │
+        # │   [B,65536,40] → fc1 → [B,65536,160] → GELU               │
+        # │   → [B,65536,160] → fc2 → [B,65536,40] → drop            │
+        # └────────────────────────────────────────────────────────────┘
+        #
+        # 完整链路: mlp → norm2 → drop_path → 残差相加
+        # 光谱分支: [B, 16384, 160] + [B, 16384, 160] → [B, 16384, 160]
+        # 空间分支: [B, 65536, 40]  + [B, 65536, 40]  → [B, 65536, 40]
+        x = x + self.drop_path(self.norm2(self.mlp(x)))  # 残差连接②
+
+        return x  # 形状与输入完全一致
+        # 光谱分支返回: [B, 16384, 160]
+        # 空间分支返回: [B, 65536, 40]
+
+        return x  # → [B, L, C]  （形状与输入完全一致）
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
@@ -1560,68 +2046,154 @@ class YDCFN(nn.Module):
         """
         # ---- Step 1: 准备跨模态辅助信息 ----
         # 将HRMSI下采样到与LRHSI相同的空间分辨率，作为光谱分支的辅助输入
+        # 输入: hrmsi=[B, 4, 256, 256], scale_factor=0.25 → 输出: [B, 4, 64, 64]
         lrmsi = torch.nn.functional.interpolate(hrmsi, scale_factor=0.25, mode='bicubic')
         # 将LRHSI上采样到与HRMSI相同的空间分辨率，作为空间分支的辅助输入
+        # 输入: lrhsi=[B, 172, 64, 64], scale_factor=4 → 输出: [B, 172, 256, 256]
         hrhsi =  torch.nn.functional.interpolate(lrhsi, scale_factor=4, mode='bilinear')
 
         # ==================== 光谱分支 (Spectral Branch) ====================
-        # 拼接LR-HSI(172ch)和下采样的LR-MSI(Mm ch)作为光谱分支输入
-        lrhsi = self.lrelu(self.hsiconv1(torch.cat((lrhsi, lrmsi), 1)))
+        # 拼接LR-HSI(172ch)和下采样的LR-MSI(4ch)作为光谱分支输入
+        # ┌──────────────────────────────────────────────────────────────────────┐
+        # │ Step1: cat((lrhsi=[B,172,64,64], lrmsi=[B,4,64,64]), dim=1)          │
+        # │       → [B, 176, 64, 64]                                             │
+        # │ Step2: hsiconv1=Conv2d(176→160, k=3, p=1)                            │
+        # │       → [B, 160, 64, 64]                                              │
+        # │ Step3: lrelu=LeakyReLU(0.2) 形状不变                                 │
+        # │       → [B, 160, 64, 64]                                              │
+        # └──────────────────────────────────────────────────────────────────────┘
+        lrhsi = self.lrelu(self.hsiconv1(torch.cat((lrhsi, lrmsi), 1)))  # → [B, 160, 64, 64]
+
         # 首次上采样 ×2: 64×64 → 128×128
-        lrhsi = self.up(lrhsi)
-        x_size = (lrhsi.shape[2], lrhsi.shape[3])
-        # 保存上采样后的特征用于残差连接
-        lrhsi2 = lrhsi.clone()
-        # 转换为序列格式以供HDRTB处理 [B, C, H, W] -> [B, H*W, C]
-        lrhsi = self.patch_embed(lrhsi)
-        # 通过2个HDRTB进行分层多尺度光谱特征提取
+        # up=Upsample(scale_factor=2)，双线性插值上采样，通道数不变
+        # 输入: [B, 160, 64, 64] → 输出: [B, 160, 128, 128]
+        lrhsi = self.up(lrhsi)  # → [B, 160, 128, 128]
+
+        # 记录当前空间尺寸(H,W)供后续patch_embed/patch_unembed使用
+        # 输入: lrhsi.shape=(B, 160, 128, 128) → 输出: (128, 128)
+        x_size = (lrhsi.shape[2], lrhsi.shape[3])  # → (128, 128)
+
+        # 深拷贝上采样后的特征，用于后续残差连接（skip connection）
+        # 输入: [B, 160, 128, 128] → 输出: [B, 160, 128, 128]
+        lrhsi2 = lrhsi.clone()  # → [B, 160, 128, 128]
+
+        # PatchEmbed: [B,C,H,W] → flatten(2) → transpose(1,2) → [B, H*W, C]
+        # 将图像格式的特征展平为序列格式，供Transformer/HDRTB处理
+        # 输入: [B, 160, 128, 128] → 输出: [B, 16384, 160] （128*128=16384个patch）
+        lrhsi = self.patch_embed(lrhsi)  # → [B, 16384, 160]
+
+        # 通过2个HDRTB(SwinBasedFeatFusionBlock)进行分层多尺度光谱特征提取
+        # 每个HDRTB内部含4个HierarchicalTransformerBlock(SSCL)，使用渐进窗口
+        # 输入: [B, 16384, 160] → 输出: [B, 16384, 160] （形状不变，语义增强）
         for ii,layer in enumerate(self.hsifeat):
-            lrhsi = layer(lrhsi, x_size)
-        # 转换回图像格式 [B, H*W, C] -> [B, C, H, W]
-        lrhsi = self.patch_unembed(lrhsi, x_size)
+            lrhsi = layer(lrhsi, x_size)  # → [B, 16384, 160]
+
+        # PatchUnEmbed: [B,H*W,C] → transpose(1,2) → view(B,C,H,W) → [B,C,H,W]
+        # 将序列格式转回图像格式
+        # 输入: [B, 16384, 160], x_size=(128,128) → 输出: [B, 160, 128, 128]
+        lrhsi = self.patch_unembed(lrhsi, x_size)  # → [B, 160, 128, 128]
         
-        # 残差连接：HDRTB提取的特征 + 上采样后的初始特征
-        lrhsi = lrhsi + lrhsi2 
-        # 第二次上采样 ×2: 128×128 → 256×256（达到目标分辨率）
-        lrhsi = self.up(lrhsi)
-        lrhsi = self.lrelu(lrhsi)
-        # 光谱分支末层卷积：通道对齐到nf
-        lrhsi = self.hsiconvlast(lrhsi)
+        # 残差连接：HDRTB提取的特征 + 上采样后的初始特征（缓解梯度消失）
+        # 输入: lrhsi=[B, 160, 128, 128], lrhsi2=[B, 160, 128, 128]
+        # → 输出: [B, 160, 128, 128]
+        lrhsi = lrhsi + lrhsi2  # → [B, 160, 128, 128]
+
+        # 第二次上采样 ×2: 128×128 → 256×256（达到目标HR分辨率）
+        # 输入: [B, 160, 128, 128] → 输出: [B, 160, 256, 256]
+        lrhsi = self.up(lrhsi)  # → [B, 160, 256, 256]
+
+        # LeakyReLU激活
+        # 输入: [B, 160, 256, 256] → 输出: [B, 160, 256, 256]
+        lrhsi = self.lrelu(lrhsi)  # → [B, 160, 256, 256]
+
+        # 光谱分支末层卷积：通道从nf*2=160降到nf=80，与空间分支对齐
+        # hsiconvlast=Conv2d(160→80, k=3, s=1, p=1, groups=4)
+        # 输入: [B, 160, 256, 256] → 输出: [B, 80, 256, 256]
+        lrhsi = self.hsiconvlast(lrhsi)  # → [B, 80, 256, 256]  ← F_spe
 
         # ==================== 空间分支 (Spatial Branch) ====================
-        # 拼接HR-MSI(Mm ch)和上采样的HR-HSI(172 ch)作为空间分支输入
-        hrmsi = self.lrelu(self.msiconv1(torch.cat((hrmsi, hrhsi), 1)))
-        x_size = (hrmsi.shape[2], hrmsi.shape[3])
-        # 保存空间分支初始特征用于残差连接
-        hrmsi2=hrmsi.clone()
-        # 转换为序列格式以供HDRTB处理
-        hrmsi = self.patch_embed(hrmsi)
+        # 拼接HR-MSI(4ch)和上采样的HR-HSI(172ch)作为空间分支输入
+        # ┌──────────────────────────────────────────────────────────────────────┐
+        # │ Step1: cat((hrmsi=[B,4,256,256], hrhsi=[B,172,256,256]), dim=1)      │
+        # │       → [B, 176, 256, 256]                                           │
+        # │ Step2: msiconv1=Conv2d(176→40, k=3, p=1)  (nf//2=80//2=40)           │
+        # │       → [B, 40, 256, 256]                                             │
+        # │ Step3: lrelu=LeakyReLU(0.2) 形状不变                                  │
+        # │       → [B, 40, 256, 256]                                             │
+        # └──────────────────────────────────────────────────────────────────────┘
+        hrmsi = self.lrelu(self.msiconv1(torch.cat((hrmsi, hrhsi), 1)))  # → [B, 40, 256, 256]
+
+        # 记录当前空间尺寸(H,W)供后续patch_embed/patch_unembed使用
+        # 输入: hrmsi.shape=(B, 40, 256, 256) → 输出: (256, 256)
+        x_size = (hrmsi.shape[2], hrmsi.shape[3])  # → (256, 256)
+
+        # 深拷贝空间分支初始特征，用于后续残差连接
+        # 输入: [B, 40, 256, 256] → 输出: [B, 40, 256, 256]
+        hrmsi2=hrmsi.clone()  # → [B, 40, 256, 256]
+
+        # PatchEmbed: [B,C,H,W] → [B, H*W, C]
+        # 输入: [B, 40, 256, 256] → 输出: [B, 65536, 40] （256*256=65536个patch）
+        hrmsi = self.patch_embed(hrmsi)  # → [B, 65536, 40]
+
         # 通过2个HDRTB进行分层多尺度空间特征提取
+        # dim=nf//2=40，input_resolution=(4,4)表示在256×256图像上的等效窗口
+        # 输入: [B, 65536, 40] → 输出: [B, 65536, 40]
         for ii,layer in enumerate(self.msifeat):
-            hrmsi = layer(hrmsi, x_size)
+            hrmsi = layer(hrmsi, x_size)  # → [B, 65536, 40]
         
-        # 残差连接：空间分支HDRTB特征 + 初始特征
-        hrmsi = hrmsi2+ self.patch_unembed(hrmsi, x_size)
-        hrmsi = self.lrelu(hrmsi)
-        # 空间分支末层卷积：通道对齐到nf
-        hrmsi = self.msiconvlast(hrmsi)
+        # 残差连接：空间分支初始特征 + HDRTB输出（先unembed再相加）
+        # patch_unembed: [B, 65536, 40], x_size=(256,256) → [B, 40, 256, 256]
+        # 再与hrmsi2=[B, 40, 256, 256]相加
+        # → 输出: [B, 40, 256, 256]
+        hrmsi = hrmsi2+ self.patch_unembed(hrmsi, x_size)  # → [B, 40, 256, 256]
+
+        # LeakyReLU激活
+        # 输入: [B, 40, 256, 256] → 输出: [B, 40, 256, 256]
+        hrmsi = self.lrelu(hrmsi)  # → [B, 40, 256, 256]
+
+        # 空间分支末层卷积：通道从nf//2=40提升到nf=80，与光谱分支对齐
+        # msiconvlast=Conv2d(40→80, k=3, s=1, p=1)
+        # 输入: [B, 40, 256, 256] → 输出: [B, 80, 256, 256]
+        hrmsi = self.msiconvlast(hrmsi)  # → [B, 80, 256, 256]  ← F_spa
 
         # ==================== 特征融合 (Feature Fusion) ====================
         # 双分支特征逐元素相加（论文公式1: F_spe + F_spa），然后通过融合卷积层
-        yfd = self.conv_fuse(hrmsi + lrhsi)  # YFD (初步重建的高光谱特征)
+        # ┌──────────────────────────────────────────────────────────────────────┐
+        # │ Step1: hrmsi + lrhsi                                                 │
+        # │   [B, 80, 256, 256] + [B, 80, 256, 256] → [B, 80, 256, 256]         │
+        # │ Step2: conv_fuse = Sequential(                                       │
+        # │   Conv2d(80→172, k=3, p=1, groups=4),  (分组卷积，172%4==0)         │
+        # │   LeakyReLU(0.2))                                                    │
+        # │   → [B, 172, 256, 256]                                               │
+        # └──────────────────────────────────────────────────────────────────────┘
+        yfd = self.conv_fuse(hrmsi + lrhsi)  # YFD → [B, 172, 256, 256]
         
         # ==================== 最终重建 (Final Reconstruction F_final) ====================
         # 通过最终HDRTB进行精细化重建和细节恢复
-        x_size = (yfd.shape[2], yfd.shape[3])
-        yfd = self.patch_embed(yfd)
-        for layer in self.final_blk:
-            yfd = layer(yfd, x_size)
-        yfd = self.patch_unembed(yfd, x_size)
+        # 记录当前空间尺寸
+        # 输入: yfd.shape=(B, 172, 256, 256) → 输出: (256, 256)
+        x_size = (yfd.shape[2], yfd.shape[3])  # → (256, 256)
 
-        # 最终3×3卷积生成HR-HSI输出
-        co = self.last(yfd)
+        # PatchEmbed: 图像→序列
+        # 输入: [B, 172, 256, 256] → 输出: [B, 65536, 172]
+        yfd = self.patch_embed(yfd)  # → [B, 65536, 172]
+
+        # 通过final_blk中的1个SwinBasedFeatFusionBlock_final_block进行精细化
+        # dim=out_nc=172，使用Swin Transformer进行最终细节恢复
+        # 输入: [B, 65536, 172] → 输出: [B, 65536, 172]
+        for layer in self.final_blk:
+            yfd = layer(yfd, x_size)  # → [B, 65536, 172]
+
+        # PatchUnEmbed: 序列→图像
+        # 输入: [B, 65536, 172], x_size=(256,256) → 输出: [B, 172, 256, 256]
+        yfd = self.patch_unembed(yfd, x_size)  # → [B, 172, 256, 256]
+
+        # 最终3×3卷积生成HR-HSI输出（无偏置，纯映射）
+        # last=Conv2d(172→172, k=3, s=1, p=1, bias=False)
+        # 输入: [B, 172, 256, 256] → 输出: [B, 172, 256, 256]
+        co = self.last(yfd)  # → [B, 172, 256, 256]  ← 最终HR-HSI重建结果
         
-        return co
+        return co  # → [B, 172, 256, 256]
     
 
 class HyDCFN(nn.Module):
